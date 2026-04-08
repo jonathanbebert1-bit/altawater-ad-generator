@@ -40,9 +40,16 @@ function getDriveClient() {
 
   console.log(`[Drive] Using service account: ${credentials.client_email}`);
 
+  // Use Domain-Wide Delegation to impersonate the Drive owner.
+  // Service accounts have no storage quota of their own; DWD lets us
+  // write into the user's Drive on their behalf.
+  const impersonateUser = process.env.GOOGLE_IMPERSONATE_USER || 'jono@drinkaltawater.com';
+  console.log(`[Drive] Impersonating ${impersonateUser} via DWD`);
+
   const auth = new google.auth.GoogleAuth({
     credentials,
     scopes: ['https://www.googleapis.com/auth/drive'],
+    clientOptions: { subject: impersonateUser },
   });
 
   driveClient = google.drive({ version: 'v3', auth });
