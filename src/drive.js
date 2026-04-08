@@ -5,18 +5,17 @@
  *
  * Folder structure per ad:
  *   GOOGLE_DRIVE_FOLDER_ID/
- *     Alta Water Ads/
- *       {jobId} - {YYYY-MM-DD}/
- *         voiceover.mp3
- *         scene-0-hook.mp4
- *         scene-1-problem.mp4
- *         scene-2-solution.mp4
- *         scene-3-cta.mp4
- *         manifest.json
+ *     {jobId} - {YYYY-MM-DD}/
+ *       voiceover.mp3
+ *       scene-0-hook.mp4
+ *       scene-1-problem.mp4
+ *       scene-2-solution.mp4
+ *       scene-3-cta.mp4
+ *       manifest.json
  */
 
 import { google } from 'googleapis';
-import { createReadStream, statSync } from 'fs';
+import { createReadStream, statSync, existsSync } from 'fs';
 import { basename } from 'path';
 import { config } from './config.js';
 
@@ -25,12 +24,21 @@ let driveClient = null;
 function getDriveClient() {
   if (driveClient) return driveClient;
 
+  const rawJson = config.google.serviceAccountJson;
+  if (!rawJson) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is not set');
+
   let credentials;
   try {
-    credentials = JSON.parse(config.google.serviceAccountJson);
+    credentials = typeof rawJson === 'string' ? JSON.parse(rawJson) : rawJson;
   } catch (e) {
-    throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON');
+    throw new Error(`GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON: ${e.message}`);
   }
+
+  if (!credentials.client_email || !credentials.private_key) {
+    throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is missing client_email or private_key');
+  }
+
+  console.log(`[Drive] Using service account: ${credentials.client_email}`);
 
   const auth = new google.auth.GoogleAuth({
     credentials,
@@ -42,20 +50,47 @@ function getDriveClient() {
 }
 
 /**
+ * Retry wrapper for Drive API calls.
+ */
+async function withRetry(fn, label, maxAttempts = 3) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const isRetryable = err.code === 429 || err.code === 500 || err.code === 503
+        || err.message?.includes('ECONNRESET') || err.message?.includes('socket hang up');
+      console.error(`[Drive] ${label} attempt ${attempt}/${maxAttempts} failed: ${err.message}`);
+      if (attempt < maxAttempts && isRetryable) {
+        const delay = attempt * 2000;
+        console.log(`[Drive] Retrying in ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+      } else if (attempt === maxAttempts) {
+        break;
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Create a subfolder inside a parent folder.
- * Returns the new folder ID.
+ * Returns the new folder metadata { id, name, webViewLink }.
  */
 async function createFolder(name, parentFolderId) {
   const drive = getDriveClient();
-  const res = await drive.files.create({
-    requestBody: {
-      name,
-      mimeType: 'application/vnd.google-apps.folder',
-      parents: [parentFolderId],
-    },
-    fields: 'id, name, webViewLink',
-  });
-  return res.data;
+  return withRetry(async () => {
+    const res = await drive.files.create({
+      requestBody: {
+        name,
+        mimeType: 'application/vnd.google-apps.folder',
+        parents: [parentFolderId],
+      },
+      fields: 'id, name, webViewLink',
+    });
+    return res.data;
+  }, `createFolder(${name})`);
 }
 
 /**
@@ -70,29 +105,43 @@ async function uploadFile(localPath, folderId, displayName) {
     : fileName.endsWith('.json') ? 'application/json'
     : 'application/octet-stream';
 
+  if (!existsSync(localPath)) {
+    throw new Error(`File does not exist: ${localPath}`);
+  }
+
   const fileSize = statSync(localPath).size;
+  if (fileSize === 0) {
+    throw new Error(`File is empty (0 bytes): ${localPath}`);
+  }
+
   console.log(`[Drive] Uploading ${fileName} (${(fileSize / 1024 / 1024).toFixed(2)} MB) to folder ${folderId}`);
 
-  const res = await drive.files.create({
-    requestBody: {
-      name: fileName,
-      parents: [folderId],
-    },
-    media: {
-      mimeType,
-      body: createReadStream(localPath),
-    },
-    fields: 'id, name, webViewLink, webContentLink, size',
-  });
+  const res = await withRetry(async () => {
+    return drive.files.create({
+      requestBody: {
+        name: fileName,
+        parents: [folderId],
+      },
+      media: {
+        mimeType,
+        body: createReadStream(localPath),
+      },
+      fields: 'id, name, webViewLink, webContentLink, size',
+    });
+  }, `uploadFile(${fileName})`);
 
-  // Make file publicly readable (anyone with link)
-  await drive.permissions.create({
-    fileId: res.data.id,
-    requestBody: {
-      role: 'reader',
-      type: 'anyone',
-    },
-  });
+  // Make file publicly readable
+  try {
+    await drive.permissions.create({
+      fileId: res.data.id,
+      requestBody: {
+        role: 'reader',
+        type: 'anyone',
+      },
+    });
+  } catch (permErr) {
+    console.warn(`[Drive] ⚠️  Could not set public permissions on ${fileName}: ${permErr.message}`);
+  }
 
   console.log(`[Drive] ✅ Uploaded ${fileName}: ${res.data.webViewLink}`);
   return res.data;
@@ -105,25 +154,31 @@ async function uploadJson(data, fileName, folderId) {
   const { Readable } = await import('stream');
   const drive = getDriveClient();
   const json = JSON.stringify(data, null, 2);
-  const stream = Readable.from([json]);
 
-  const res = await drive.files.create({
-    requestBody: {
-      name: fileName,
-      parents: [folderId],
-      mimeType: 'application/json',
-    },
-    media: {
-      mimeType: 'application/json',
-      body: stream,
-    },
-    fields: 'id, name, webViewLink',
-  });
+  const res = await withRetry(async () => {
+    const stream = Readable.from([json]);
+    return drive.files.create({
+      requestBody: {
+        name: fileName,
+        parents: [folderId],
+        mimeType: 'application/json',
+      },
+      media: {
+        mimeType: 'application/json',
+        body: stream,
+      },
+      fields: 'id, name, webViewLink',
+    });
+  }, `uploadJson(${fileName})`);
 
-  await drive.permissions.create({
-    fileId: res.data.id,
-    requestBody: { role: 'reader', type: 'anyone' },
-  });
+  try {
+    await drive.permissions.create({
+      fileId: res.data.id,
+      requestBody: { role: 'reader', type: 'anyone' },
+    });
+  } catch (permErr) {
+    console.warn(`[Drive] ⚠️  Could not set public permissions on ${fileName}: ${permErr.message}`);
+  }
 
   return res.data;
 }
@@ -141,12 +196,25 @@ export async function uploadAdAssets(jobId, script, voiceoverPath, scenes) {
   const parentFolderId = config.google.driveFolderId;
   if (!parentFolderId) throw new Error('GOOGLE_DRIVE_FOLDER_ID is not set');
 
-  const dateSuffix = new Date().toISOString().slice(0, 10);
-  const folderName = `${jobId} - ${dateSuffix}`;
+  // Validate drive client upfront to catch credential errors early
+  try {
+    getDriveClient();
+  } catch (err) {
+    throw new Error(`Drive client init failed: ${err.message}`);
+  }
 
-  console.log(`[Drive] Creating ad folder: "${folderName}"`);
-  const adFolder = await createFolder(folderName, parentFolderId);
-  console.log(`[Drive] Folder created: ${adFolder.webViewLink}`);
+  const dateSuffix = new Date().toISOString().slice(0, 10);
+  const folderName = `${jobId.slice(0, 8)} - ${dateSuffix}`;
+
+  console.log(`[Drive] Creating ad folder: "${folderName}" inside ${parentFolderId}`);
+
+  let adFolder;
+  try {
+    adFolder = await createFolder(folderName, parentFolderId);
+    console.log(`[Drive] Folder created: ${adFolder.webViewLink}`);
+  } catch (err) {
+    throw new Error(`Failed to create Drive folder: ${err.message}`);
+  }
 
   const manifest = {
     jobId,
@@ -176,7 +244,11 @@ export async function uploadAdAssets(jobId, script, voiceoverPath, scenes) {
   // Upload each video scene
   for (const scene of scenes) {
     if (!scene.localFile) {
-      manifest.scenes.push({ index: scene.index, label: scene.label, error: scene.error });
+      manifest.scenes.push({
+        index: scene.index,
+        label: scene.label,
+        error: scene.error || 'No local file available',
+      });
       continue;
     }
     try {
@@ -209,6 +281,7 @@ export async function uploadAdAssets(jobId, script, voiceoverPath, scenes) {
     console.error(`[Drive] ⚠️  Manifest upload failed: ${err.message}`);
   }
 
-  console.log(`[Drive] ✅ All assets uploaded. Folder: ${adFolder.webViewLink}`);
+  const successCount = manifest.scenes.filter(s => !s.error).length;
+  console.log(`[Drive] ✅ Upload complete: ${successCount}/${manifest.scenes.length} scenes + voiceover. Folder: ${adFolder.webViewLink}`);
   return manifest;
 }
