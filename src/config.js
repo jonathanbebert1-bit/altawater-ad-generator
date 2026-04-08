@@ -22,8 +22,8 @@ export const config = {
   },
   runway: {
     apiKey: process.env.RUNWAY_API_KEY || '',
-    // gen4_turbo is the current Runway Gen-4 model identifier
-    model: process.env.RUNWAY_MODEL || 'gen4_turbo',
+    // gen4.5 is the current Runway model (gen4_turbo was deprecated)
+    model: process.env.RUNWAY_MODEL || 'gen4.5',
     // 9:16 vertical for Meta/TikTok — 768x1280
     resolution: process.env.RUNWAY_RESOLUTION || '768:1280',
     duration: parseInt(process.env.RUNWAY_CLIP_DURATION || '5', 10), // seconds per clip

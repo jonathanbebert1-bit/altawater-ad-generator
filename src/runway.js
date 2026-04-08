@@ -82,7 +82,7 @@ async function generateScene(scenePrompt, jobId) {
   // Use waitForTaskOutput() — SDK polls automatically
   const task = await client.textToVideo
     .create({
-      model: 'gen4_turbo',
+      model: config.runway.model,
       promptText: prompt,
       ratio: '720:1280',   // 9:16 vertical for Meta/TikTok
       duration: config.runway.duration,
