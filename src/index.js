@@ -16,7 +16,7 @@ import { join } from 'path';
 
 import { config, validateConfig } from './config.js';
 import { generateVoiceover } from './elevenlabs.js';
-import { generateVideoScenes } from './runway.js';
+import { generateVideoFromScript, checkVideoStatus } from './banana.js';
 import { uploadAdAssets } from './drive.js';
 import {
   createJob,
